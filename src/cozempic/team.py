@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import uuid as uuid_mod
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -589,8 +591,222 @@ def _is_task_tool_result(msg_dict: dict, pending_task_ids: set[str]) -> bool:
     return False
 
 
+class _TeamProjectionAccumulator:
+    """Order-preserving fold of team-coordination events from JSONL messages.
+
+    Folding every message ONCE in line order via :func:`_fold_team_messages`
+    and calling :meth:`snapshot` yields the SAME TeamState as a full
+    :func:`extract_team_state` replay. Unlike the replay, the fold is
+    INCREMENTAL and PERSISTENT: callers fold one append-batch at a time and
+    serialize the accumulator (to_dict/from_dict) alongside a byte cursor, so
+    a new process — or one whose message cache has evicted the original
+    records — continues where it left off without ever re-reading history.
+
+    The fields below are exactly the mutable working state of the extractor.
+    Two extra marker sets preserve full-replay semantics under batched folds:
+
+    notif_subagents  — subagent keys whose status was set by a pass-2
+                       task-notification. In a full replay pass 2 runs AFTER
+                       every call/result, so a notification verdict ALWAYS
+                       wins over a TaskStop/tool_result "completed" regardless
+                       of textual order; pass 1 must not downgrade it when the
+                       two events land in different batches.
+    pass2_teammates  — teammate ids whose status was set by a pass-2 verdict
+                       (terminal notification / idle). Same rule: a later
+                       TeamDelete/Agent-result in another batch must not wipe
+                       it. A fresh SendMessage (the only legitimate
+                       re-activation) still overrides unconditionally, exactly
+                       as in the single-pass ordering. Any residual ambiguity
+                       fails toward keeping the member NON-terminal (over-defer
+                       is recoverable; an under-block can SIGKILL live work).
+    """
+
+    VERSION = 1
+
+    def __init__(self) -> None:
+        # Scalar view mutated mid-fold (team_name / message_count / cursor).
+        # Snapshot copies these onto a fresh TeamState — this object never
+        # receives entity lists or config.json merges.
+        self.scratch = TeamState()
+        self.seen_teammates: dict[str, TeammateInfo] = {}
+        self.seen_subagents: dict[str, SubagentInfo] = {}
+        # Latest line index of a SendMessage to each teammate — used so a completion
+        # notification in the (later) second pass does NOT clobber a re-activation
+        # that chronologically followed it (the two-pass extractor would otherwise
+        # discard event ordering and mark a still-working teammate "completed").
+        self.last_send_line: dict[str, int] = {}
+        self.seen_tasks: dict[str, TaskInfo] = {}
+        # TaskCreate's tool INPUT carries no id (the system assigns it and returns it
+        # in the tool_result: "Task #N created"). Map each TaskCreate tool_use_id to
+        # the temp key its task is parked under, so the result handler can re-key it
+        # to the REAL id. Persisted across batches so a late result still pairs with
+        # its call after the call itself was cache-evicted (or the process restarted).
+        self.taskcreate_uid_to_key: dict[str, str] = {}
+        # Track tool_use_id -> tool_name for matching results to calls
+        self.tool_use_id_to_name: dict[str, str] = {}
+        # Track tool_use_id -> subagent key for Task tool results
+        self.tool_use_id_to_subagent: dict[str, str] = {}
+        # Track bare teammate name -> agentId for SendMessage bare-name resolution (P0-C)
+        # and idle_notification resolution (P0-D). Populated when a TeammateInfo is
+        # inserted into seen_teammates with a known bare name.
+        self.name_to_agent_id: dict[str, str] = {}
+        # Collected by the pre-pass (team tool_use ids, incl. "Agent") so tool_result
+        # messages pair with their calls. Accumulates across folds: a result in a
+        # new batch matches calls from every earlier batch.
+        self.pending_task_ids: set[str] = set()
+        # Pass-2 verdict markers (see class docstring).
+        self.notif_subagents: set[str] = set()
+        self.pass2_teammates: set[str] = set()
+        # Last 3 lead text blocks for the "Lead Context" summary (rolling window
+        # replaces the replay's gather-all-then-take-last-3).
+        self.lead_texts: deque[str] = deque(maxlen=3)
+
+    def fold(self, messages: list[Message]) -> None:
+        """Fold one in-order batch (a contiguous prefix slice of the file)."""
+        if messages:
+            _fold_team_messages(self, messages)
+
+    def snapshot(self) -> TeamState:
+        """Finalize the projection into a TeamState (config.json merged).
+
+        Constructs a FRESH TeamState each call so the config.json merge (which
+        appends config-only teammates) never pollutes the persistent fold.
+        """
+        state = TeamState()
+        state.team_name = self.scratch.team_name
+        state.message_count = self.scratch.message_count
+        state.last_coordination_index = self.scratch.last_coordination_index
+
+        # FRESH COPIES: merge_config_into_state() enriches teammates in place
+        # (model/cwd from config.json). The projection stores JSONL facts only,
+        # so config ground truth — which may change between cycles — is re-merged
+        # against pristine entities on every snapshot and never persisted into
+        # the sidecar or leaked back into the fold.
+        state.teammates = [replace(t) for t in self.seen_teammates.values()]
+        state.subagents = [replace(s) for s in self.seen_subagents.values()]
+        # A TaskCreate whose result was missing/torn/reworded never got re-keyed, so
+        # its task_id still holds the internal "__pending_create_<uid>" sentinel.
+        # Rewrite those to a clean positional id (matching the pre-#167 convention)
+        # on FRESH COPIES — the accumulator's own entities keep the sentinel key so
+        # (a) repeated snapshots stay pure/idempotent and (b) a good result in a
+        # LATER batch can still pop the parked entry and re-key it to the real id.
+        # Skip ids already taken by a real re-keyed task to avoid duplicates.
+        _used_ids = {_t.task_id for _t in self.seen_tasks.values()
+                     if not _t.task_id.startswith("__pending_create_")}
+        _next = 0
+        _tasks_out: list[TaskInfo] = []
+        for _t in self.seen_tasks.values():
+            if _t.task_id.startswith("__pending_create_"):
+                while str(_next) in _used_ids:
+                    _next += 1
+                _tasks_out.append(replace(_t, task_id=str(_next)))
+                _used_ids.add(str(_next))
+                _next += 1
+            else:
+                _tasks_out.append(_t)
+        state.tasks = _tasks_out
+        state.config_source = "jsonl" if state.message_count > 0 else ""
+
+        if self.lead_texts:
+            state.lead_summary = " [...] ".join(self.lead_texts)
+
+        # Merge with config.json ground truth (if available)
+        return merge_config_into_state(state)
+
+    # ── serialization ──────────────────────────────────────────────
+    def to_dict(self) -> dict:
+        return {
+            "version": self.VERSION,
+            "team_name": self.scratch.team_name,
+            "message_count": self.scratch.message_count,
+            "last_coordination_index": self.scratch.last_coordination_index,
+            "teammates": [vars(t) for t in self.seen_teammates.values()],
+            "subagents": [vars(s) for s in self.seen_subagents.values()],
+            "tasks": [vars(t) for t in self.seen_tasks.values()],
+            "task_keys": list(self.seen_tasks.keys()),
+            "teammate_keys": list(self.seen_teammates.keys()),
+            "subagent_keys": list(self.seen_subagents.keys()),
+            "last_send_line": self.last_send_line,
+            "taskcreate_uid_to_key": self.taskcreate_uid_to_key,
+            "tool_use_id_to_name": self.tool_use_id_to_name,
+            "tool_use_id_to_subagent": self.tool_use_id_to_subagent,
+            "name_to_agent_id": self.name_to_agent_id,
+            "pending_task_ids": sorted(self.pending_task_ids),
+            "notif_subagents": sorted(self.notif_subagents),
+            "pass2_teammates": sorted(self.pass2_teammates),
+            "lead_texts": list(self.lead_texts),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "_TeamProjectionAccumulator":
+        if not isinstance(d, dict) or d.get("version") != cls.VERSION:
+            raise ValueError("bad projection version")
+        acc = cls()
+        acc.scratch.team_name = d.get("team_name", "") or ""
+        mc = d.get("message_count", 0)
+        acc.scratch.message_count = mc if isinstance(mc, int) else 0
+        li = d.get("last_coordination_index", -1)
+        acc.scratch.last_coordination_index = li if isinstance(li, int) else -1
+
+        acc.seen_teammates = {
+            k: TeammateInfo(**v) for k, v in zip(
+                d.get("teammate_keys", []), d.get("teammates", []))
+            if isinstance(v, dict)
+        }
+        acc.seen_subagents = {
+            k: SubagentInfo(**v) for k, v in zip(
+                d.get("subagent_keys", []), d.get("subagents", []))
+            if isinstance(v, dict)
+        }
+        acc.seen_tasks = {
+            k: TaskInfo(**v) for k, v in zip(
+                d.get("task_keys", []), d.get("tasks", []))
+            if isinstance(v, dict)
+        }
+
+        def _str_map(name: str) -> dict[str, str]:
+            raw = d.get(name, {})
+            if not isinstance(raw, dict):
+                return {}
+            return {str(k): str(v) for k, v in raw.items()
+                    if isinstance(k, str) and isinstance(v, str)}
+
+        def _int_map(name: str) -> dict[str, int]:
+            raw = d.get(name, {})
+            if not isinstance(raw, dict):
+                return {}
+            return {str(k): v for k, v in raw.items()
+                    if isinstance(k, str) and isinstance(v, int)}
+
+        acc.last_send_line = _int_map("last_send_line")
+        acc.taskcreate_uid_to_key = _str_map("taskcreate_uid_to_key")
+        acc.tool_use_id_to_name = _str_map("tool_use_id_to_name")
+        acc.tool_use_id_to_subagent = _str_map("tool_use_id_to_subagent")
+        acc.name_to_agent_id = _str_map("name_to_agent_id")
+
+        def _str_set(name: str) -> set[str]:
+            raw = d.get(name, [])
+            if not isinstance(raw, list):
+                return set()
+            return {str(x) for x in raw if isinstance(x, str)}
+
+        acc.pending_task_ids = _str_set("pending_task_ids")
+        acc.notif_subagents = _str_set("notif_subagents")
+        acc.pass2_teammates = _str_set("pass2_teammates")
+        texts = d.get("lead_texts", [])
+        if isinstance(texts, list):
+            for t in texts[-3:]:
+                if isinstance(t, str):
+                    acc.lead_texts.append(t)
+        return acc
+
+
 def extract_team_state(messages: list[Message]) -> TeamState:
     """Scan messages for team coordination patterns and extract state.
+
+    Full-replay reference: builds a fresh :class:`_TeamProjectionAccumulator`,
+    folds every message once, and snapshots. Incremental checkpointing shares
+    the exact same fold, so its result is identical to replaying the file.
 
     Looks for:
     - Task tool calls (subagent spawns with subagent_type, prompt, description)
@@ -600,37 +816,44 @@ def extract_team_state(messages: list[Message]) -> TeamState:
     - TaskCreate / TaskUpdate tool calls (shared todo list)
     - Teammate spawn details (agent IDs, roles)
     """
-    state = TeamState()
-    seen_teammates: dict[str, TeammateInfo] = {}
-    seen_subagents: dict[str, SubagentInfo] = {}
-    # Latest line index of a SendMessage to each teammate — used so a completion
-    # notification in the (later) second pass does NOT clobber a re-activation
-    # that chronologically followed it (the two-pass extractor would otherwise
-    # discard event ordering and mark a still-working teammate "completed").
-    last_send_line: dict[str, int] = {}
-    seen_tasks: dict[str, TaskInfo] = {}
-    # TaskCreate's tool INPUT carries no id (the system assigns it and returns it
-    # in the tool_result: "Task #N created"). Map each TaskCreate tool_use_id to
-    # the temp key its task is parked under, so the result handler can re-key it
-    # to the REAL id. Without this, creates were keyed positionally (str(len(...)))
-    # while TaskUpdate keys by the real id → completed tasks render as pending and
-    # phantom blank tasks appear in the recovered checkpoint.
-    taskcreate_uid_to_key: dict[str, str] = {}
+    acc = _TeamProjectionAccumulator()
+    acc.fold(messages)
+    return acc.snapshot()
 
-    # Track tool_use_id -> tool_name for matching results to calls
-    tool_use_id_to_name: dict[str, str] = {}
-    # Track tool_use_id -> subagent key for Task tool results
-    tool_use_id_to_subagent: dict[str, str] = {}
-    # Track bare teammate name -> agentId for SendMessage bare-name resolution (P0-C)
-    # and idle_notification resolution (P0-D). Populated when a TeammateInfo is
-    # inserted into seen_teammates with a known bare name.
-    _name_to_agent_id: dict[str, str] = {}
+
+def _fold_team_messages(acc: _TeamProjectionAccumulator, messages: list[Message]) -> None:
+    """Fold one in-order message batch into *acc*.
+
+    This is the body of the historical single-shot extractor, parameterized
+    by the accumulator so the same code path serves full replay and
+    incremental/persisted projection. A batch must be a CONTIGUOUS slice of
+    physical lines in file order; callers feed batches oldest→newest.
+    """
+    # Local aliases into accumulator state — the fold body below is unchanged
+    # from the single-shot implementation.
+    state = acc.scratch
+    seen_teammates = acc.seen_teammates
+    seen_subagents = acc.seen_subagents
+    last_send_line = acc.last_send_line
+    seen_tasks = acc.seen_tasks
+    taskcreate_uid_to_key = acc.taskcreate_uid_to_key
+    tool_use_id_to_name = acc.tool_use_id_to_name
+    tool_use_id_to_subagent = acc.tool_use_id_to_subagent
+    _name_to_agent_id = acc.name_to_agent_id
+    pending_task_ids = acc.pending_task_ids
+    notif_subagents = acc.notif_subagents
+    pass2_teammates = acc.pass2_teammates
+    lead_texts = acc.lead_texts
+    # Batch-local: tool_use ids whose CALL and RESULT have both been folded.
+    # Used once at the end to prune now-dead pairing bookkeeping (see tail).
+    consumed_uids: set[str] = set()
 
     # Pre-pass: collect all team tool_use IDs so _is_team_message can match
     # their corresponding tool_result messages (task completions, etc.).
     # Uses _TEAM_EXTRACT_TOOL_NAMES (includes "Agent") so Agent spawn results
     # are also scanned; _is_team_message itself still uses TEAM_TOOL_NAMES only.
-    pending_task_ids: set[str] = set()
+    # IDs ACCUMULATE on the accumulator across batches, so a tool_result in this
+    # batch still pairs with a call from any earlier (possibly evicted) batch.
     for _, msg, _ in messages:
         inner = msg.get("message")
         if not isinstance(inner, dict):
@@ -749,7 +972,12 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # TaskStop = stopping a background agent
                 elif name == "TaskStop":
                     task_id = _sfield(inp, "task_id")
-                    if task_id and task_id in seen_subagents:
+                    # Gate on notif_subagents: in the full-replay ordering a
+                    # task-notification verdict (pass 2) ALWAYS lands after pass 1,
+                    # so a stop can never win over it — even when the two events
+                    # arrive in different fold batches.
+                    if (task_id and task_id in seen_subagents
+                            and task_id not in notif_subagents):
                         seen_subagents[task_id].status = "stopped"
 
                 # TeamCreate (explicit team)
@@ -816,7 +1044,13 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     _suffix = "@" + _del_team
                     if _del_team:
                         for _tm in seen_teammates.values():
-                            if (_tm.agent_id or "").endswith(_suffix):
+                            # pass2_teammates gate: a pass-2 notification/idle
+                            # verdict for this member outranks a TeamDelete that
+                            # folds in from a later batch (full replay applies all
+                            # pass-2 verdicts after every pass-1 event). A genuine
+                            # re-SendMessage still flips status back to running.
+                            if ((_tm.agent_id or "").endswith(_suffix)
+                                    and _tm.agent_id not in pass2_teammates):
                                 _tm.status = "completed"
 
                 # TaskCreate (shared todo list)
@@ -930,8 +1164,12 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     result_text = _extract_block_text(block)
 
                     if subagent_key and subagent_key in seen_subagents:
-                        seen_subagents[subagent_key].status = "completed"
-                        seen_subagents[subagent_key].result_summary = result_text[:300]
+                        # Never downgrade a status/summary a task-notification
+                        # already set in an earlier fold batch (pass 2 outranks
+                        # pass 1 in a full replay).
+                        if subagent_key not in notif_subagents:
+                            seen_subagents[subagent_key].status = "completed"
+                            seen_subagents[subagent_key].result_summary = result_text[:300]
 
                     # Check if result contains an agent_id we should track
                     agent_id_match = re.search(r"agent[_-]?id[:\s]+([a-f0-9-]+)", result_text, re.I)
@@ -939,7 +1177,23 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                         real_id = agent_id_match.group(1)
                         agent = seen_subagents.pop(subagent_key)
                         agent.agent_id = real_id
-                        seen_subagents[real_id] = agent
+                        _existing_notif = seen_subagents.get(real_id)
+                        if (_existing_notif is not None
+                                and real_id in notif_subagents):
+                            # A notification under the REAL id folded in BEFORE
+                            # the spawn result (out-of-order batches / torn file).
+                            # Keep the notification verdict; backfill only the
+                            # spawn-time facts a replay would have on record.
+                            if agent.subagent_type:
+                                _existing_notif.subagent_type = agent.subagent_type
+                            if agent.description:
+                                _existing_notif.description = agent.description
+                        else:
+                            seen_subagents[real_id] = agent
+                            # Carry the verdict marker across the re-key.
+                            if subagent_key in notif_subagents:
+                                notif_subagents.discard(subagent_key)
+                                notif_subagents.add(real_id)
 
                 # Agent tool result: parse real agentId + team_name from spawn text.
                 # Format: "Spawned successfully.\nagent_id: NAME@TEAM\n..."
@@ -961,9 +1215,19 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                         if placeholder and placeholder in seen_teammates:
                             tm = seen_teammates.pop(placeholder)
                             tm.agent_id = real_agent_id
-                            if _fg_done:
+                            # A pass-2 verdict under the placeholder or the real
+                            # id outranks the foreground-done completion.
+                            _prev_marked = seen_teammates.get(real_agent_id)
+                            if real_agent_id in pass2_teammates and _prev_marked is not None:
+                                # Preserve the notification status carried by an
+                                # entity already installed under the real id.
+                                tm.status = _prev_marked.status
+                            elif _fg_done and placeholder not in pass2_teammates:
                                 tm.status = "completed"
                             seen_teammates[real_agent_id] = tm
+                            if placeholder in pass2_teammates:
+                                pass2_teammates.discard(placeholder)
+                                pass2_teammates.add(real_agent_id)
                             # Populate name → agentId index for bare-name resolution.
                             # Index BOTH the teammate name AND the agentId's bare prefix
                             # (alice ← alice@myteam): a completion task-notification often
@@ -996,17 +1260,32 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                         placeholder = tool_use_id_to_subagent.get(tool_use_id, "")
                         if placeholder and placeholder in seen_teammates:
                             _low = result_text.lower()
-                            if _fg_done:
-                                seen_teammates[placeholder].status = "completed"
-                            elif any(k in _low for k in (
-                                    "error", "fail", "quota", "rejected", "denied",
-                                    "could not", "unable", "cancel", "timeout")):
-                                seen_teammates[placeholder].status = "failed"
+                            # Pass-2 verdict (folded from another batch) wins.
+                            if placeholder not in pass2_teammates:
+                                if _fg_done:
+                                    seen_teammates[placeholder].status = "completed"
+                                elif any(k in _low for k in (
+                                        "error", "fail", "quota", "rejected", "denied",
+                                        "could not", "unable", "cancel", "timeout")):
+                                    seen_teammates[placeholder].status = "failed"
                             # else: keep "running" — unparseable success defers (safe)
                     # Parse team_name from result if not yet set
                     team_m = _AGENT_SPAWN_TEAM_RE.search(result_text)
                     if team_m and not state.team_name:
                         state.team_name = team_m.group(1).strip()
+
+                # Mark the call/result pair CONSUMED for end-of-batch pruning.
+                # Gates: (a) the call must have been folded BEFORE this result
+                # — tool_name/subagent lookup hit — never trust pending_task_ids
+                # alone, since the prepass adds same-batch uids and a malformed
+                # result-before-call transcript would otherwise orphan the call;
+                # (b) a TORN TaskCreate (result seen but no parseable "Task #N")
+                # stays retained so a later retry result can still re-key it.
+                if (tool_use_id
+                        and tool_use_id in pending_task_ids
+                        and (tool_name or tool_use_id in tool_use_id_to_subagent)
+                        and tool_use_id not in taskcreate_uid_to_key):
+                    consumed_uids.add(tool_use_id)
 
     # ── Second pass: scan for task-notifications and idle-notifications ──
     # Both XML patterns live in string content (user messages or queue-operations),
@@ -1081,6 +1360,9 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     status=status,
                     result_summary=result[:300],
                 )
+            # Marker: this entity's status is a pass-2 verdict — pass 1 events
+            # from later fold batches must not downgrade it.
+            notif_subagents.add(task_id)
 
             # Propagate terminal status to the matching TEAMMATE.
             # Resolve bare task_id → real agentId when the notification carries
@@ -1092,6 +1374,7 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     # A SendMessage after this notification means re-activation
                     # (phase 2) → keep "running" so the gate keeps blocking.
                     seen_teammates[candidate].status = status
+                    pass2_teammates.add(candidate)
                     break
 
             # Count team-coordination activity once per genuine task-notification
@@ -1134,6 +1417,8 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 # the teammate — don't clobber "running" back to "idle".
                 if line_idx >= last_send_line.get(resolved, -1):
                     seen_teammates[resolved].status = "idle"
+                    # Pass-2 verdict marker — see accumulator class docstring.
+                    pass2_teammates.add(resolved)
             else:
                 # A NON-idle teammate-message means the teammate just SPOKE — it is
                 # alive and working. Re-activate it from a benign (idle/unknown)
@@ -1146,31 +1431,13 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                 if cur in ("idle", "unknown", ""):
                     seen_teammates[resolved].status = "running"
 
-    state.teammates = list(seen_teammates.values())
-    state.subagents = list(seen_subagents.values())
-    # A TaskCreate whose result was missing/torn/reworded never got re-keyed, so
-    # its task_id still holds the internal "__pending_create_<uid>" sentinel.
-    # Rewrite those to a clean positional id (matching the pre-#167 convention) so
-    # the sentinel never appears in internal state. Markdown renders by
-    # subject+status, so this is display-invisible; the rewrite keeps task_id sane
-    # for any future consumer. Skip ids already taken by a real re-keyed task so we
-    # never mint a duplicate task_id.
-    _used_ids = {_t.task_id for _t in seen_tasks.values()
-                 if not _t.task_id.startswith("__pending_create_")}
-    _next = 0
-    for _t in seen_tasks.values():
-        if _t.task_id.startswith("__pending_create_"):
-            while str(_next) in _used_ids:
-                _next += 1
-            _t.task_id = str(_next)
-            _used_ids.add(str(_next))
-            _next += 1
-    state.tasks = list(seen_tasks.values())
-    state.config_source = "jsonl" if state.message_count > 0 else ""
-
-    # Build lead summary from last few team-related assistant messages
-    team_msgs: list[str] = []
-    for line_idx, msg, byte_size in messages:
+    # Per-batch lead-context collection. The single-shot replay gathered ALL of
+    # these then took the last 3; the deque(maxlen=3) on the accumulator keeps
+    # exactly the global last 3 across arbitrarily many fold batches. Uses
+    # _is_team_message (TEAM_TOOL_NAMES, no pending ids) — same predicate as the
+    # replay, NOT the _is_extract_message superset, so Agent-only messages are
+    # not swept in here.
+    for _, msg, _ in messages:
         if msg.get("type") == "assistant" and _is_team_message(msg):
             inner = msg.get("message", {})
             content = inner.get("content", []) if isinstance(inner, dict) else []
@@ -1179,15 +1446,211 @@ def extract_team_state(messages: list[Message]) -> TeamState:
                     if isinstance(block, dict) and block.get("type") == "text":
                         _t = block.get("text", "")
                         if isinstance(_t, str):  # non-str text would crash the [:300] slice (#2)
-                            team_msgs.append(_t[:300])
+                            lead_texts.append(_t[:300])
 
-    if team_msgs:
-        state.lead_summary = " [...] ".join(team_msgs[-3:])
+    # Prune pairing bookkeeping whose call AND result have both been folded.
+    # Runs AFTER both passes so the consumed result still counts toward
+    # message_count in THIS batch. Unpaired calls (background spawns awaiting
+    # their result, torn writes) are untouched and survive every batch/restart
+    # until their result shows up — that retention is the whole point of the
+    # persistent projection. (A formally-invalid DUPLICATE tool_result for an
+    # already-consumed uid would no longer count after pruning; the API never
+    # emits duplicate results for one tool_use_id.)
+    for _uid in consumed_uids:
+        pending_task_ids.discard(_uid)
+        tool_use_id_to_name.pop(_uid, None)
+        tool_use_id_to_subagent.pop(_uid, None)
 
-    # Merge with config.json ground truth (if available)
-    state = merge_config_into_state(state)
 
-    return state
+# ─── Persistent team projection (checkpoint hot path) ──────────────────────
+#
+# checkpoint_team runs in the guard's ~30s main loop. It used to derive team
+# state from load_messages_incremental(), whose per-path cache EVICTS everything
+# but the newest MAX_CACHED_MESSAGES (5000) records. Once a session grew past
+# that window, a TaskCreate / teammate spawn older than the window vanished
+# from every subsequent checkpoint — the TaskUpdate could no longer pair with
+# its call and members reverted to placeholders. A process restart was worse
+# (the cache started cold).
+#
+# The projection below persists the folded accumulator NEXT TO the session as
+# a small JSON sidecar, together with the byte cursor it has consumed through:
+#   first call ........ full fold of the whole file
+#   later calls ....... fold only complete lines past the cursor
+#   restart ........... accumulator loaded from the sidecar, folding continues
+#   os.replace ........ inode change → discard + full rebuild
+#   truncation ........ size shrink / mtime regress / same-size rewrite → rebuild
+# Result equivalence: snapshot() == extract_team_state(load_messages(path)).
+
+_PROJ_SIDECAR_SUFFIX = ".teamproj"
+# Serializes checkpoint hot paths across the guard loop and the overflow
+# watcher thread (both can call checkpoint_team for the same session).
+_PROJ_LOCK = threading.Lock()
+
+
+def _team_projection_path(session_path: Path) -> Path:
+    """Sidecar holding the folded accumulator + byte cursor for *session_path*."""
+    session_path = Path(session_path)
+    return session_path.with_name("." + session_path.name + _PROJ_SIDECAR_SUFFIX)
+
+
+def _load_projection_sidecar(
+    sidecar: Path,
+) -> tuple[_TeamProjectionAccumulator, dict] | None:
+    """Return (accumulator, cursor) from a sidecar, or None if absent/invalid.
+
+    Any parse/shape error is treated as 'no projection' — the caller performs
+    a full rebuild instead, so a torn/corrupt/foreign sidecar can never wedge
+    checkpointing.
+    """
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    cursor = payload.get("cursor")
+    if not isinstance(cursor, dict):
+        return None
+    try:
+        acc = _TeamProjectionAccumulator.from_dict(payload.get("projection", {}))
+    except (TypeError, ValueError, KeyError):
+        return None
+    # Reject a cursor with wrong-shaped identity fields.
+    for k in ("inode", "offset", "next_line_index", "size", "mtime_ns"):
+        if not isinstance(cursor.get(k), int):
+            return None
+    if cursor["offset"] < 0 or cursor["next_line_index"] < 0:
+        return None
+    return acc, cursor
+
+
+def _save_projection_sidecar(
+    sidecar: Path, acc: _TeamProjectionAccumulator, cursor: dict
+) -> None:
+    """Atomically persist accumulator + cursor.
+
+    ensure_ascii=True (json default) escapes surrogateescape-decoded non-UTF-8
+    bytes as \\uXXXX, so the sidecar is always strict ASCII/UTF-8 and reloads
+    the same code points; the checkpoint renderer replaces lone surrogates at
+    its sanitization chokepoint anyway.
+    """
+    from .helpers import atomic_write_text
+
+    payload = json.dumps(
+        {
+            "version": _TeamProjectionAccumulator.VERSION,
+            "cursor": cursor,
+            "projection": acc.to_dict(),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    atomic_write_text(sidecar, payload)
+
+
+def build_session_team_state(session_path: Path | str) -> TeamState:
+    """Project the current team state of a session, persistently/incrementally.
+
+    See the section comment above. Always returns a usable TeamState; on any
+    unexpected projection error it falls back to a full file replay, then to
+    an empty state rather than raising into the guard hot path.
+    """
+    session_path = Path(session_path)
+    try:
+        with _PROJ_LOCK:
+            return _build_session_team_state_locked(session_path)
+    except Exception:
+        # Best-effort hot path: never wedge the guard on projection machinery.
+        try:
+            from .session import load_messages
+            return extract_team_state(load_messages(session_path))
+        except Exception:
+            return TeamState()
+
+
+def _build_session_team_state_locked(session_path: Path) -> TeamState:
+    from .session import _parse_one_line, _split_physical_lines
+
+    sidecar = _team_projection_path(session_path)
+    try:
+        st = session_path.stat()
+    except OSError:
+        # Session vanished — nothing to project; drop any stale sidecar.
+        try:
+            sidecar.unlink()
+        except OSError:
+            pass
+        return TeamState()
+
+    acc: _TeamProjectionAccumulator | None = None
+    start_offset = 0
+    start_line = 0
+    loaded = _load_projection_sidecar(sidecar)
+    if loaded is not None:
+        acc, cursor = loaded
+        # Invalidation mirrors load_messages_incremental exactly:
+        # inode change (os.replace prune), any size shrink (in-place
+        # truncation), mtime regression, or same-size in-place rewrite.
+        needs_rebuild = (
+            st.st_ino != cursor["inode"]
+            or st.st_size < cursor["size"]
+            or st.st_mtime_ns < cursor["mtime_ns"]
+            or (st.st_mtime_ns > cursor["mtime_ns"]
+                and st.st_size == cursor["size"])
+        )
+        if not needs_rebuild:
+            start_offset = cursor["offset"]
+            start_line = cursor["next_line_index"]
+            if start_offset > st.st_size:
+                # Defensive: cursor past EOF without a recorded shrink.
+                acc = None
+            elif (start_offset == st.st_size
+                  and st.st_mtime_ns == cursor["mtime_ns"]):
+                # File unchanged — return the snapshot without rewriting the
+                # sidecar (no churn, identical to the loader's cache fast path).
+                return acc.snapshot()
+        else:
+            acc = None
+
+    if acc is None:
+        # First build OR invalidation → full fold from byte 0.
+        acc = _TeamProjectionAccumulator()
+        start_offset = 0
+        start_line = 0
+
+    with open(session_path, "rb") as f:
+        f.seek(start_offset)
+        raw = f.read(max(0, st.st_size - start_offset))
+
+    # Fold only COMPLETE lines — a trailing partial line is a writer mid-
+    # append; the remainder is picked up on the next cycle.
+    last_newline = raw.rfind(b"\n")
+    if last_newline == -1:
+        # No new complete lines; leave the cursor exactly where it was.
+        return acc.snapshot()
+
+    complete = raw[: last_newline + 1]
+    text = complete.decode("utf-8", "surrogateescape")
+    physical_lines = _split_physical_lines(text)
+    batch: list[Message] = []
+    for i, line in enumerate(physical_lines):
+        parsed = _parse_one_line(line, start_line + i)
+        if parsed is not None:
+            batch.append(parsed)
+
+    acc.fold(batch)
+
+    new_cursor = {
+        "inode": st.st_ino,
+        "offset": start_offset + len(complete),
+        # next_line_index counts EVERY physical line (incl. blank/unparseable),
+        # matching load_messages_incremental's tuple index numbering.
+        "next_line_index": start_line + len(physical_lines),
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+    }
+    _save_projection_sidecar(sidecar, acc, new_cursor)
+    return acc.snapshot()
 
 
 # ─── Config.json ground truth ─────────────────────────────────────────────

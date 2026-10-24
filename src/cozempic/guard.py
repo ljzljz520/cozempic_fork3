@@ -212,13 +212,13 @@ from .session import (
     find_sessions,
     load_messages,
     load_messages_and_snapshot,
-    load_messages_incremental,
     repair_torn_trailing_line,
     save_messages,
     snapshot_session,
 )
 from .team import (
-    TeamState, extract_team_state, inject_team_recovery, write_team_checkpoint,
+    TeamState, build_session_team_state, extract_team_state,
+    inject_team_recovery, write_team_checkpoint,
     _AGENT_DONE_TRAILER_RE,
 )
 from .tokens import default_token_thresholds, quick_token_estimate
@@ -376,10 +376,12 @@ def checkpoint_team(
             return None
         session_path = sess["path"]
 
-    # Scan-only hot path — use incremental loader to avoid unbounded RSS growth
-    # from repeated full-file reads in the guard's 30s main loop.
-    messages = load_messages_incremental(session_path)
-    state = extract_team_state(messages)
+    # Scan-only hot path — the persistent team projection folds only newly
+    # appended lines per cycle (byte-offset cursor) and survives both the
+    # incremental message cache's 5000-record eviction and process restarts.
+    # Full state is retained on disk even after the original TaskCreate/spawn
+    # records have aged out of every in-memory window.
+    state = build_session_team_state(session_path)
 
     if state.is_empty():
         if not quiet:
